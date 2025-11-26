@@ -68,7 +68,7 @@ router.post('/login', async (req, res) => {
 // Refresh (simplified: add rotation + reuse detection later)
 router.post('/refresh', async (req, res) => {
     const refreshTokenPlain = req.cookies['refresh_token'];
-    if (!refreshTokenPlain) return res.status(401).json({ error: 'no_refresh' });
+    if (!refreshTokenPlain) return res.status(401).json({ error: 'no_refresh_token' });
   
     const refreshHash = hashRefreshToken(refreshTokenPlain);
     const client = await pool.connect();
@@ -77,37 +77,55 @@ router.post('/refresh', async (req, res) => {
       await client.query('BEGIN');
   
       const { rows } = await client.query(
-        `SELECT id, user_id, expires_at, revoked
-         FROM refresh_tokens WHERE token_hash=$1 FOR UPDATE`,
+        `SELECT id, user_id, revoked, replaced_by_token, expires_at
+         FROM refresh_tokens
+         WHERE token_hash=$1
+         FOR UPDATE`,
         [refreshHash]
       );
   
+      // If token not found → possible reuse of stolen token
       if (!rows.length) {
-        // token not found -> can treat as invalid/possible reuse
         await client.query('ROLLBACK');
         return res.status(401).json({ error: 'invalid_refresh' });
       }
   
       const tokenRow = rows[0];
+      const userId = tokenRow.user_id;
   
-      if (tokenRow.revoked || new Date(tokenRow.expires_at) < new Date()) {
-        // Already revoked or expired
+      // EXPIRED?
+      if (new Date(tokenRow.expires_at) < new Date()) {
         await client.query('ROLLBACK');
-        return res.status(401).json({ error: 'invalid_refresh' });
+        return res.status(401).json({ error: 'refresh_expired' });
       }
   
-      // Fetch user
-      const userResult = await client.query(
+      if (tokenRow.revoked || tokenRow.replaced_by_token) {
+        // Revoke all existing refresh tokens & force logout-all
+        await client.query(
+          `UPDATE refresh_tokens SET revoked=true WHERE user_id=$1`,
+          [userId]
+        );
+  
+        // Bump token_version (kills all access tokens immediately)
+        await client.query(
+          `UPDATE users SET token_version = token_version + 1 WHERE id=$1`,
+          [userId]
+        );
+  
+        await client.query('COMMIT');
+  
+        res.clearCookie('refresh_token', { path: '/auth/refresh' });
+  
+        return res.status(401).json({ error: 'reuse_detected', action: 'logout_all' });
+      }
+  
+      // 🔄 VALID REFRESH — ROTATE IT
+      const userRes = await client.query(
         'SELECT id, token_version, roles FROM users WHERE id=$1',
-        [tokenRow.user_id]
+        [userId]
       );
-      if (!userResult.rows.length) {
-        await client.query('ROLLBACK');
-        return res.status(401).json({ error: 'user_not_found' });
-      }
-      const user = userResult.rows[0];
+      const user = userRes.rows[0];
   
-      // Issue new tokens (access + refresh)
       const { accessToken, refreshTokenPlain: newRefreshPlain, refreshTokenId } =
         await issueTokensForUser({
           id: user.id,
@@ -115,7 +133,7 @@ router.post('/refresh', async (req, res) => {
           roles: user.roles,
         });
   
-      // Revoke old refresh token & link replacement
+      // Revoke old & link to new token
       await client.query(
         `UPDATE refresh_tokens
          SET revoked=true, replaced_by_token=$1
@@ -126,15 +144,17 @@ router.post('/refresh', async (req, res) => {
       await client.query('COMMIT');
   
       setRefreshCookie(res, newRefreshPlain);
-      return res.json({ accessToken, expiresIn: 5 * 60 });
+      return res.json({ accessToken });
+  
     } catch (err) {
       await client.query('ROLLBACK');
-      console.error('refresh error', err);
-      return res.status(500).json({ error: 'internal' });
+      console.error(err);
+      return res.status(500).json({ error: 'internal_error' });
     } finally {
       client.release();
     }
   });
+  
 
 // Logout
 router.post('/logout', async (req, res) => {

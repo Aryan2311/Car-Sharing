@@ -21,15 +21,15 @@ app.use(express.json());
 app.use(cookieParser());
 
 // Rate limiting: strong on login/refresh routes
-const authLimiter = rateLimit({
+const authLimiter = (rate : number)=> rateLimit({
   windowMs: 5 * 60 * 1000, // 5 min
-  max: 20, // 20 attempts per 5 min per IP
+  max: rate, // 20 attempts per 5 min per IP
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-app.use('/auth/login', authLimiter);
-app.use('/auth/refresh', authLimiter);
+app.use('/auth/login', authLimiter(20));
+app.use('/auth/refresh', authLimiter(100));
 
 // Main routes
 app.use('/auth', authRoutes);
