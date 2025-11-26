@@ -67,39 +67,74 @@ router.post('/login', async (req, res) => {
 
 // Refresh (simplified: add rotation + reuse detection later)
 router.post('/refresh', async (req, res) => {
-  const refreshTokenPlain = req.cookies['refresh_token'];
-  if (!refreshTokenPlain) return res.status(401).json({ error: 'no_refresh' });
-
-  const hash = hashRefreshToken(refreshTokenPlain);
-  const { rows } = await pool.query(
-    `SELECT id, user_id, expires_at, revoked FROM refresh_tokens WHERE token_hash=$1`,
-    [hash]
-  );
-  if (!rows.length) return res.status(401).json({ error: 'invalid_refresh' });
-
-  const tokenRow = rows[0];
-  if (tokenRow.revoked || new Date(tokenRow.expires_at) < new Date()) {
-    return res.status(401).json({ error: 'invalid_refresh' });
-  }
-
-  // (Here you should do single-use rotation logic; for now keep it simple)
-
-  // Fetch user
-  const u = await pool.query('SELECT id, token_version, roles FROM users WHERE id=$1', [tokenRow.user_id]);
-  const user = u.rows[0];
-
-  const { accessToken, refreshTokenPlain: newRefresh } = await issueTokensForUser({
-    id: user.id,
-    token_version: user.token_version,
-    roles: user.roles,
+    const refreshTokenPlain = req.cookies['refresh_token'];
+    if (!refreshTokenPlain) return res.status(401).json({ error: 'no_refresh' });
+  
+    const refreshHash = hashRefreshToken(refreshTokenPlain);
+    const client = await pool.connect();
+  
+    try {
+      await client.query('BEGIN');
+  
+      const { rows } = await client.query(
+        `SELECT id, user_id, expires_at, revoked
+         FROM refresh_tokens WHERE token_hash=$1 FOR UPDATE`,
+        [refreshHash]
+      );
+  
+      if (!rows.length) {
+        // token not found -> can treat as invalid/possible reuse
+        await client.query('ROLLBACK');
+        return res.status(401).json({ error: 'invalid_refresh' });
+      }
+  
+      const tokenRow = rows[0];
+  
+      if (tokenRow.revoked || new Date(tokenRow.expires_at) < new Date()) {
+        // Already revoked or expired
+        await client.query('ROLLBACK');
+        return res.status(401).json({ error: 'invalid_refresh' });
+      }
+  
+      // Fetch user
+      const userResult = await client.query(
+        'SELECT id, token_version, roles FROM users WHERE id=$1',
+        [tokenRow.user_id]
+      );
+      if (!userResult.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(401).json({ error: 'user_not_found' });
+      }
+      const user = userResult.rows[0];
+  
+      // Issue new tokens (access + refresh)
+      const { accessToken, refreshTokenPlain: newRefreshPlain, refreshTokenId } =
+        await issueTokensForUser({
+          id: user.id,
+          token_version: user.token_version,
+          roles: user.roles,
+        });
+  
+      // Revoke old refresh token & link replacement
+      await client.query(
+        `UPDATE refresh_tokens
+         SET revoked=true, replaced_by_token=$1
+         WHERE id=$2`,
+        [refreshTokenId, tokenRow.id]
+      );
+  
+      await client.query('COMMIT');
+  
+      setRefreshCookie(res, newRefreshPlain);
+      return res.json({ accessToken, expiresIn: 5 * 60 });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('refresh error', err);
+      return res.status(500).json({ error: 'internal' });
+    } finally {
+      client.release();
+    }
   });
-
-  // revoke old refresh
-  await pool.query('UPDATE refresh_tokens SET revoked=true WHERE id=$1', [tokenRow.id]);
-
-  setRefreshCookie(res, newRefresh);
-  res.json({ accessToken, expiresIn: 15 * 60 });
-});
 
 // Logout
 router.post('/logout', async (req, res) => {
