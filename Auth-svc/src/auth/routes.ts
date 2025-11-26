@@ -149,10 +149,29 @@ router.post('/logout', async (req, res) => {
 
 // Logout all (global)
 router.post('/logout-all', async (req, res) => {
-  const userId = req.body.userId; // in real app, take from access token, not body
-  await pool.query('UPDATE users SET token_version = token_version + 1 WHERE id=$1', [userId]);
-  await pool.query('UPDATE refresh_tokens SET revoked=true WHERE user_id=$1', [userId]);
+  const userId = req.body.user_id; // from access token
+
+  await pool.query('BEGIN');
+  try {
+    await pool.query(
+      'UPDATE users SET token_version = token_version + 1 WHERE id=$1',
+      [userId]
+    );
+    await pool.query(
+      'UPDATE refresh_tokens SET revoked=true WHERE user_id=$1',
+      [userId]
+    );
+    await pool.query('COMMIT');
+  } catch (e) {
+    await pool.query('ROLLBACK');
+    console.error(e);
+    return res.status(500).json({ error: 'internal' });
+  }
+
+  // Clear refresh cookie from this device
+  res.clearCookie('refresh_token', { path: '/auth/refresh' });
   res.status(204).end();
 });
+
 
 export default router;
