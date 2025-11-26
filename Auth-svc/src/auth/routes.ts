@@ -4,7 +4,12 @@ import { hashRefreshToken, generateRefreshTokenValue } from './refresh';
 import { pool } from '../db';
 import { config } from '../config/env';
 import { getJwks } from './jwks';
-import cookieParser from 'cookie-parser';
+import { z } from 'zod';
+
+const loginSchema = z.object({
+  email: z.email(),
+  password: z.string().min(8).max(128),
+});
 
 const router = express.Router();
 
@@ -27,7 +32,11 @@ router.get('/.well-known/jwks.json', async (_req, res) => {
 
 // Register
 router.post('/register', async (req, res) => {
-  const { email, password } = req.body;
+  const parse = loginSchema.safeParse(req.body);
+  if (!parse.success) {
+    return res.status(400).json({ error: 'invalid_payload', details: parse.error.issues });
+  }
+  const { email, password } = parse.data;
   // basic validation here...
   try {
     const user = await createUser(email, password);
@@ -43,7 +52,11 @@ router.post('/register', async (req, res) => {
 
 // Login
 router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
+  const parse = loginSchema.safeParse(req.body);
+  if (!parse.success) {
+    return res.status(400).json({ error: 'invalid_payload', details: parse.error.issues });
+  }
+  const { email, password } = parse.data;
   const user = await validateUser(email, password);
   if (!user) return res.status(401).json({ error: 'invalid_credentials' });
 

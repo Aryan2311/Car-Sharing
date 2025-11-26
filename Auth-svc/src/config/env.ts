@@ -9,4 +9,5 @@ export const config = {
   refreshTokenKey: process.env.REFRESH_TOKEN_KEY!,
   privateKeyPath: process.env.RSA_PRIVATE_KEY_PATH!,
   publicKeyPath: process.env.RSA_PUBLIC_KEY_PATH!,
+  frontendOrigin: process.env.FRONTEND_ORIGIN || 'http://localhost:3000',
 };
